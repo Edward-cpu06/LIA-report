@@ -1,0 +1,840 @@
+/*
+ * ======================================================================================
+ * CODE SUMMARY:
+ * This code controls a multi-functional Arduino robot with four main modes of operation:
+ * * 1. IR Remote Mode: Manual control using an infrared remote (move, turn, speed control).
+ * 2. Obstacle Avoidance: Autonomous navigation using an Ultrasonic sensor mounted on a 
+ * Servo to look left/right and avoid collisions.
+ * 3. Line Tracking: Autonomous driving following a line on the ground using 3 analog sensors.
+ * 4. Manual Mode: A pre-programmed sequence of movements (scripted path).
+ * * FEATURES:
+ * - Uses Adafruit NeoPixel for status indication (colors change based on mode).
+ * - Uses PWM (Pulse Width Modulation) for variable motor speed control.
+ * - Implements a State Machine (switch/case) to handle different robot behaviors.
+ * ======================================================================================
+ */
+
+#include <Servo.h>              // Include the library to control the Servo motor
+#include <IRremote.h>           // Include the library to receive IR remote signals
+#include <Adafruit_NeoPixel.h>  // Include the library to control RGB LEDs
+
+#define IR_RECEIVE_PIN 9 // Define the digital pin connected to the IR receiver data line
+#define LED_PIN 4        // Define the digital pin connected to the RGB LED
+#define LED_COUNT 1      // Set the number of LEDs to control (just 1)
+
+// Initialize the NeoPixel object with the defined count, pin, and color type settings
+Adafruit_NeoPixel rgb(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800); 
+
+// --- MOTOR PINS ---
+#define AIN_1 8   // Define Pin 8 for Motor A direction control 1
+#define BIN_1 7   // Define Pin 7 for Motor B direction control 1
+#define BIN_PWM 6 // Define Pin 6 for Motor B speed control (PWM)
+#define AIN_PWM 5 // Define Pin 5 for Motor A speed control (PWM)
+#define standby 3 // Define Pin 3 for the Motor Driver Standby (Enable) pin
+
+// --- REMOTE HEX CODES ---
+// These hexadecimal codes correspond to specific buttons on the physical remote
+#define IR_top 0xB946FF00    // Hex code for the Forward button
+#define IR_bottom 0xEA15FF00 // Hex code for the Backward button
+#define IR_left 0xBB44FF00   // Hex code for the Left Turn button
+#define IR_right 0xBC43FF00  // Hex code for the Right Turn button
+#define IR_stop 0xBF40FF00   // Hex code for the Stop button
+
+#define IR_speed_down  0xBD42FF00 // Hex code for button (*) to decrease speed
+#define IR_speed_up  0xB54AFF00   // Hex code for button (#) to increase speed
+
+// Mode selection buttons
+#define IR_IR 0xE916FF00       // Button (1): Switch to Remote Control mode
+#define IR_OBJECT 0xE619FF00   // Button (2): Switch to Obstacle Avoidance mode
+#define IR_TRACKING 0xF20DFF00 // Button (3): Switch to Line Tracking mode
+#define IR_MANUAL 0xF30CFF00   // Button (4): Switch to Manual/Scripted mode
+
+// Define a custom list of possible states (Modes) for the robot
+enum MODE {
+  IR,       // Remote control state
+  OBJECT,   // Obstacle avoidance state
+  TRACKING, // Line tracking state
+  MANUAL,   // Scripted movement state
+  SLEEP     // Idle/Stop state
+};
+
+MODE currentMode = SLEEP; // Create a variable to hold the current mode, start in SLEEP
+unsigned long modeVal = 0; // Create a variable to store the raw data received from the remote
+
+// --- SENSOR PINS ---
+// Line tracking analog input pins
+#define L3 A2 // Define Pin A2 for the Left Line Sensor
+#define M4 A1 // Define Pin A1 for the Middle Line Sensor
+#define R5 A0 // Define Pin A0 for the Right Line Sensor
+
+// Obstacle Avoidance pins
+#define servo 10      // Define Pin 10 for the Servo motor control
+Servo myservo;        // Create a Servo object named 'myservo'
+#define ULTecho 12    // Define Pin 12 for Ultrasonic Sensor Echo (Input)
+#define ULTtrig 13    // Define Pin 13 for Ultrasonic Sensor Trigger (Output)
+
+const int PROXIMITY_THRESHOLD = 25; // Set the safe distance limit to 25 cm
+long distance_cm; // Variable to store the calculated distance
+
+// Define states for the obstacle avoidance scanning logic
+enum pos {
+  straight,   // State: Robot is looking/moving straight
+  scan_left,  // State: Robot is scanning to the left
+  scan_right  // State: Robot is scanning to the right
+};
+
+int angle = 90; // Initialize servo angle to 90 degrees (center)
+pos state = straight; // Initialize the scanning state to 'straight'
+String lastDirection = "STOP"; // Variable to remember the last move (for speed adjustments)
+
+int motorSpeed = 200; // Set the default motor speed (range 0-255)
+
+// --- SETUP FUNCTION ---
+void setup() {
+  // Create an array holding all pins that need to be OUTPUTS
+  int Motor_array[7] = {AIN_1, BIN_1, BIN_PWM, AIN_PWM, standby, ULTtrig};
+  
+  // Loop through the array to configure each pin
+  for ( int Motor = 0; Motor < 7; Motor++) {
+    pinMode(Motor_array[Motor], OUTPUT); // Set the current pin in the loop to OUTPUT mode
+  }
+  
+  pinMode(ULTecho, INPUT); // Set the Ultrasonic Echo pin to INPUT mode
+  
+  Serial.begin(9600); // Start serial communication at 9600 baud for debugging
+  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK); // Initialize the IR receiver
+  
+  myservo.attach(10); // Attach the servo object to physical pin 10
+  myservo.write(angle); // Move the servo to the initial angle (90 degrees)
+
+  rgb.begin(); // Initialize the RGB LED
+  rgb.show();  // Push the data to the LED (turns it off initially)
+  rgb.setBrightness(50); // Set the LED brightness to 50 (out of 255)
+}
+
+// --- MAIN LOOP ---
+void loop() {
+  
+  // Check if an IR signal has been received and decoded
+  if (IrReceiver.decode()) {
+    // Check if the signal is NOT a "repeat" flag (holding the button down)
+    if (!(IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
+      modeVal = IrReceiver.decodedIRData.decodedRawData; // Save the new signal data
+    }
+    IrReceiver.resume(); // Reset the receiver to listen for the next signal
+  }
+
+  // --- MODE SWITCHING LOGIC ---
+  if (modeVal == IR_IR) { // If Button 1 is pressed
+    Stop(); // Stop the motors immediately
+    currentMode = IR; // Set mode to Remote Control
+    modeVal = 0; // Clear the signal
+  }
+  else if (modeVal == IR_OBJECT) { // If Button 2 is pressed
+    Stop(); // Stop the motors
+    currentMode = OBJECT; // Set mode to Obstacle Avoidance
+    modeVal = 0; // Clear the signal
+  }
+  else if (modeVal == IR_TRACKING) { // If Button 3 is pressed
+    Stop(); // Stop the motors
+    currentMode = TRACKING; // Set mode to Line Tracking
+    modeVal = 0; // Clear the signal
+  }
+  else if (modeVal == IR_MANUAL) { // If Button 4 is pressed
+    Stop(); // Stop the motors
+    delay(1000); // Wait for 1 second
+    currentMode = MANUAL; // Set mode to Manual Script
+    modeVal = 0; // Clear the signal
+  }
+  else if (modeVal == IR_stop){ // If Stop Button is pressed
+    currentMode = SLEEP; // Set mode to Sleep
+    modeVal = 0; // Clear the signal
+  }
+
+  // --- EXECUTE CURRENT MODE ---
+  switch(currentMode) {
+    case IR: // If in Remote Control Mode
+      rgb.setPixelColor(0, rgb.Color(128,128,0)); // Set LED to Yellow
+      rgb.show(); // Update the LED
+      IR_remote (); // Run the remote control function
+      break; // Exit the switch
+
+    case OBJECT: // If in Obstacle Avoidance Mode
+      rgb.setPixelColor(0,rgb.Color(128,0,128)); // Set LED to Purple
+      rgb.show(); // Update the LED
+      object_avoidance(); // Run the obstacle avoidance function
+      break; // Exit the switch
+
+    case TRACKING: // If in Line Tracking Mode
+      rgb.setPixelColor(0, rgb.Color(0,128,128)); // Set LED to Teal
+      rgb.show(); // Update the LED
+      light_tracking(); // Run the line tracking function
+      break; // Exit the switch
+
+    case MANUAL: // If in Manual Script Mode
+      rgb.setPixelColor(0, rgb.Color(0, 255, 0)); // Set LED to Green
+      rgb.show(); // Update the LED
+      Manual(); // Run the manual sequence function
+      break; // Exit the switch
+
+    case SLEEP: // If in Sleep Mode
+      rgb.setPixelColor(0, rgb.Color(255, 0, 0)); // Set LED to Red
+      rgb.show(); // Update the LED
+      Stop(); // Ensure motors are stopped
+      break; // Exit the switch
+  }
+}
+
+// --- OBSTACLE AVOIDANCE FUNCTION ---
+void object_avoidance() {
+  distance_cm = calculateDistance(); // Measure current distance to object
+  Serial.print("State: "); // Print label for debugging
+
+  // Check the current scanning state
+  switch(state) {
+    
+    // CASE 1: LOOKING STRAIGHT
+    case straight:
+      Serial.print("STRAIGHT"); // Debug print
+      myservo.write(90); // Look forward
+      Forward(120); // Move forward at speed 120
+      
+      // If an object is detected closer than threshold
+      if (distance_cm < PROXIMITY_THRESHOLD && distance_cm > 0) {
+        Serial.println(" -> Blocked! Checking LEFT."); // Debug print
+        state = scan_left; // Change state to Scan Left
+        Stop(); // Stop moving
+      } else {
+        Serial.println(" -> Path Clear (Forward)"); // Debug print
+      }
+      break;
+    
+    // CASE 2: SCANNING LEFT
+    case scan_left:
+      Serial.print("SCANNING LEFT"); // Debug print
+      myservo.write(180); // Rotate servo to look Left
+      delay(500); // Wait for servo to move
+      distance_cm = calculateDistance(); // Measure distance at new angle
+      
+      // If the Left path is clear
+      if (distance_cm >= PROXIMITY_THRESHOLD) {
+         state = straight; // Reset state to straight
+         Serial.println(" -> Left is Clear. Turning Left."); // Debug print
+         Left(120); // Turn the robot Left
+         delay(450); // Keep turning for 450ms
+      }
+      // If Left is also blocked
+      else {
+         state = scan_right; // Change state to Scan Right
+         Serial.println(" -> Left Blocked! Checking RIGHT."); // Debug print
+      }
+      break;
+    
+    // CASE 3: SCANNING RIGHT
+    case scan_right:
+      Serial.print("SCANNING RIGHT"); // Debug print
+      myservo.write(0); // Rotate servo to look Right
+      delay(500); // Wait for servo to move
+      distance_cm = calculateDistance(); // Measure distance
+      
+      // If the Right path is clear
+      if (distance_cm >= PROXIMITY_THRESHOLD) {
+         state = straight; // Reset state to straight
+         Serial.println(" -> Right is Clear. Turning Right."); // Debug print
+         Right(120); // Turn the robot Right
+         delay(450); // Keep turning for 450ms
+      }
+      // If Right is also blocked (All paths blocked)
+      else if (distance_cm < PROXIMITY_THRESHOLD && distance_cm > 0) {
+         state = straight; // Reset state to straight (to retry loop)
+         Serial.println(" -> All Blocked! Reversing."); // Debug print
+         myservo.write(90); // Look forward
+         delay(500); // Wait for servo
+         Backward(120); // Reverse the robot
+         delay(450); // Reverse for 450ms
+         Left(120); // Turn the robot around
+         delay(1300); // Turn for 1.3 seconds
+      }
+      break;
+  }
+  Serial.print(" | Dist: "); // Print label
+  Serial.println(distance_cm); // Print the distance value
+  delay(200); // Small delay to stabilize the loop
+}
+
+// Function to calculate distance using Ultrasonic sensor
+long calculateDistance() {
+  digitalWrite(ULTtrig, LOW); // Ensure Trigger is Low
+  delayMicroseconds(2); // Wait 2 microseconds
+  digitalWrite(ULTtrig, HIGH); // Set Trigger High
+  delayMicroseconds(10); // Keep High for 10 microseconds to send pulse
+  digitalWrite(ULTtrig, LOW); // Set Trigger Low
+  long duration = pulseIn(ULTecho, HIGH); // Measure time for Echo pin to go High
+  return duration * 0.034 / 2; // Calculate distance (Speed of sound / 2)
+}
+
+// --- LINE TRACKING FUNCTION ---
+void light_tracking() {
+  int leftStatus = analogRead(L3); // Read analog value of Left sensor
+  int midStatus = analogRead(M4); // Read analog value of Middle sensor
+  int rightStatus = analogRead(R5); // Read analog value of Right sensor
+
+  // Store values in shorter variables
+  int l = leftStatus; 
+  int m = midStatus;
+  int r = rightStatus;
+
+  // Logic: > 1000 usually means Dark (Line), < 700 means Light (Floor)
+  
+  if (l && m && r > 1000) Stop(); // If all sensors see the line (intersection/stop), Stop.
+  else if (m > 700) Forward(60); // If middle sensor sees line, go Forward
+  else if (l > 700) Left(60); // If left sensor sees line, Turn Left
+  else if (r > 700) Right(60); // If right sensor sees line, Turn Right
+  else Right(60); // If no line is seen, drift Right to find it
+}
+
+// --- MOTOR MOVEMENT FUNCTIONS ---
+
+// Function to move Forward
+void Forward(int speedVal) {
+  digitalWrite(AIN_1, 1); // Set Motor A direction to Forward
+  digitalWrite(BIN_1, 1); // Set Motor B direction to Forward
+  analogWrite(AIN_PWM, speedVal); // Set Motor A Speed (PWM)
+  analogWrite(BIN_PWM, speedVal); // Set Motor B Speed (PWM)
+  digitalWrite(standby, 1); // Enable the Motor Driver
+}
+
+// Function to move Backward
+void Backward(int speedVal) {
+  digitalWrite(AIN_1, 0); // Set Motor A direction to Backward
+  digitalWrite(BIN_1, 0); // Set Motor B direction to Backward
+  analogWrite(AIN_PWM, speedVal); // Set Motor A Speed
+  analogWrite(BIN_PWM, speedVal); // Set Motor B Speed
+  digitalWrite(standby, 1); // Enable the Motor Driver
+}
+
+// Function to Turn Right
+void Right(int speedVal) {
+  digitalWrite(AIN_1, 1); // Set Motor A Forward
+  digitalWrite(BIN_1, 0); // Set Motor B Backward (Tank turn)
+  analogWrite(AIN_PWM, speedVal); // Set Motor A Speed
+  analogWrite(BIN_PWM, speedVal); // Set Motor B Speed
+  digitalWrite(standby, 1); // Enable the Motor Driver
+}
+
+// Function to Turn Left
+void Left(int speedVal) {
+  digitalWrite(AIN_1, 0); // Set Motor A Backward
+  digitalWrite(BIN_1, 1); // Set Motor B Forward (Tank turn)
+  analogWrite(AIN_PWM, speedVal); // Set Motor A Speed
+  analogWrite(BIN_PWM, speedVal); // Set Motor B Speed
+  digitalWrite(standby, 1); // Enable the Motor Driver
+}
+
+// Function to Turn Left while moving Forward (Curve)
+void LeftForward(int speedVal) {
+  digitalWrite(AIN_1, 0); // Direction setting
+  digitalWrite(BIN_1, 1); // Direction setting
+  analogWrite(AIN_PWM, speedVal); // Full speed on one side
+  analogWrite(BIN_PWM, speedVal/2); // Half speed on other side
+  digitalWrite(standby, 1); // Enable motors
+}
+
+// Function to Turn Right while moving Forward (Curve)
+void RightForward(int speedVal) {
+  digitalWrite(AIN_1, 1); // Direction setting
+  digitalWrite(BIN_1, 1); // Direction setting
+  analogWrite(AIN_PWM, speedVal/2); // Half speed on one side
+  analogWrite(BIN_PWM, speedVal); // Full speed on other side
+  digitalWrite(standby, 1); // Enable motors
+}
+
+// Function to Turn Left while moving Backward
+void LeftBackward(int speedVal) {
+  digitalWrite(AIN_1, 0); // Direction setting
+  digitalWrite(BIN_1, 0); // Direction setting
+  analogWrite(AIN_PWM, speedVal); // Full speed
+  analogWrite(BIN_PWM, speedVal/2); // Half speed
+  digitalWrite(standby, 1); // Enable motors
+}
+
+// Function to Turn Right while moving Backward
+void RightBackward(int speedVal) {
+  digitalWrite(AIN_1, 0); // Direction setting
+  digitalWrite(BIN_1, 0); // Direction setting
+  analogWrite(AIN_PWM, speedVal/2); // Half speed
+  analogWrite(BIN_PWM, speedVal); // Full speed
+  digitalWrite(standby, 1); // Enable motors
+}
+
+// Function to Stop all motors
+void Stop () {
+  analogWrite(AIN_PWM, 0); // Set Speed A to 0
+  analogWrite(BIN_PWM, 0); // Set Speed B to 0
+  digitalWrite(standby, 1); // Keep driver enabled (or set to 0 to disable)
+}
+
+// Helper function for 180 degree turns
+void turnLeft180(int speedVal) {
+  int leftStatus = digitalRead(L3); // Read sensor
+  int midStatus = digitalRead(M4); // Read sensor
+  int rightStatus = digitalRead(R5); // Read sensor
+  
+  // Set speed for turn
+  analogWrite(AIN_PWM, speedVal);
+  analogWrite(BIN_PWM, speedVal);
+
+  // Set direction to turn left
+  digitalWrite(AIN_1, LOW);
+  digitalWrite(BIN_1, HIGH);
+  delay(150); // Turn for specific time
+}
+
+// --- MANUAL SCRIPT FUNCTION ---
+void Manual() {
+  Forward(200); delay(4700); // Drive Forward for 4.7s
+  Stop();       delay(1000); // Stop for 1s
+  Right(100);   delay(550);  // Turn Right for 0.55s
+  Stop();       delay(1020); // Stop
+  Forward(200); delay(4700); // Drive Forward
+  Stop();       delay(1000); // Stop
+  Right(100);   delay(500);  // Turn Right
+  Stop();       delay(1000); // Stop
+  Forward(200); delay(4300); // Drive Forward
+  Stop();       delay(1000); // Stop
+  Right(100);   delay(550);  // Turn Right
+  Stop();       delay(1000); // Stop
+  Forward(200); delay(2500); // Drive Forward
+  Stop();       delay(1000); // Stop
+  Right(100);   delay(550);  // Turn Right
+  Stop();       delay(1000); // Stop
+}
+
+// --- REMOTE CONTROL FUNCTION ---
+void IR_remote () {
+ if (modeVal == 0) return; // If no button pressed, exit function
+
+      // Check which button was pressed
+      switch (modeVal) {
+      case IR_top: // Forward Button
+        Forward(motorSpeed); // Move Forward
+        lastDirection = "Forward"; // Remember direction
+      break;
+      
+      case IR_bottom: // Backward Button
+        Backward(motorSpeed); // Move Backward
+        lastDirection = "Backward"; // Remember direction
+      break;
+      
+      case IR_left: // Left Button
+        Left(motorSpeed); // Turn Left
+        lastDirection = "Left"; // Remember direction
+      break;
+      
+      case IR_right: // Right Button
+        Right(motorSpeed); // Turn Right
+        lastDirection = "Right"; // Remember direction
+      break;
+      
+      case IR_speed_up: // Speed Up Button
+             motorSpeed += 20; // Increase speed variable by 20
+             if(motorSpeed > 255) motorSpeed = 255; // Cap max speed at 255
+             applyLastDirection(); // Update motor speed immediately
+             break;
+      case IR_speed_down: // Speed Down Button
+             motorSpeed -= 20; // Decrease speed variable by 20
+             if(motorSpeed < 0) motorSpeed = 0; // Cap min speed at 0
+             applyLastDirection(); // Update motor speed immediately
+             break;
+    }
+  modeVal = 0; // Reset the button value so it doesn't repeat endlessly
+}
+
+// Function to refresh the motors with the current speed setting
+void applyLastDirection() {
+  if (lastDirection == "Forward") Forward(motorSpeed); // Re-apply Forward
+  else if (lastDirection == "Backward") Backward(motorSpeed); // Re-apply Backward
+  else if (lastDirection == "Left") Left(motorSpeed); // Re-apply Left
+  else if (lastDirection == "Right") Right(motorSpeed); // Re-apply Right
+}ne Tracking Sensors
+#define L3 A2 // Left sensor
+#define M4 A1 // Middle sensor
+#define R5 A0 // Right sensor
+
+// Obstacle Avoidance Components
+#define servo 10      // Servo pin
+Servo myservo;
+#define ULTecho 12    // Ultrasonic Echo (Input)
+#define ULTtrig 13    // Ultrasonic Trig (Output)
+
+const int PROXIMITY_THRESHOLD = 25; // Stop if closer than 25cm
+long distance_cm;
+
+// Scanning States for Obstacle Avoidance
+enum pos {
+  straight,
+  scan_left,
+  scan_right
+};
+int angle = 90; // Default servo angle (forward)
+pos state = straight;
+String lastDirection = "STOP";
+
+int motorSpeed = 200; // Default speed (0-255)
+
+
+// --- SETUP ---
+void setup() {
+  // Setup Motor and Sensor pins as Input or Output
+  int Motor_array[7] = {AIN_1, BIN_1, BIN_PWM, AIN_PWM, standby, ULTtrig};
+  for (int Motor = 0; Motor < 7; Motor++) {
+    pinMode(Motor_array[Motor], OUTPUT);
+  }
+  pinMode(ULTecho, INPUT);
+  
+  Serial.begin(9600); // Start serial monitor
+  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK); // Start IR receiver
+  
+  myservo.attach(10); // Attach servo to pin 10
+  myservo.write(angle); // Set servo to 90 degrees
+
+  rgb.begin(); // Start LED
+  rgb.show();
+  rgb.setBrightness(50);
+}
+
+// --- MAIN LOOP ---
+void loop() {
+  
+  // 1. Check for IR signals
+  if (IrReceiver.decode()) {
+    // Ignore repeat codes (holding button down)
+    if (!(IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
+      modeVal = IrReceiver.decodedIRData.decodedRawData;
+    }
+    IrReceiver.resume(); // Listen for next signal
+  }
+
+  // 2. Switch Modes based on Remote Input
+  if (modeVal == IR_IR) {
+    Stop();
+    currentMode = IR;
+    modeVal = 0;
+  }
+  else if (modeVal == IR_OBJECT) { 
+    Stop();
+    currentMode = OBJECT; 
+    modeVal = 0;
+  }
+  else if (modeVal == IR_TRACKING) { 
+    Stop(); 
+    currentMode = TRACKING;
+    modeVal = 0;
+  }
+  else if (modeVal == IR_MANUAL) {
+    Stop();
+    delay(1000);
+    currentMode = MANUAL;
+    modeVal = 0;
+  }
+  else if (modeVal == IR_stop){
+    currentMode = SLEEP;
+    modeVal = 0;
+  }
+
+  // 3. Execute the Logic for the Current Mode
+  switch(currentMode) {
+    case IR:
+      rgb.setPixelColor(0, rgb.Color(128,128,0)); // Yellow LED
+      rgb.show();
+      IR_remote(); // Handle manual remote driving
+      break;
+
+    case OBJECT:
+      rgb.setPixelColor(0,rgb.Color(128,0,128)); // Purple LED
+      rgb.show();
+      object_avoidance(); // Run obsicle avoidance
+      break;
+
+    case TRACKING:
+      rgb.setPixelColor(0, rgb.Color(0,128,128)); // Teal LED
+      rgb.show();
+      light_tracking(); // Run line follower
+      break;
+    
+    case MANUAL:
+      rgb.setPixelColor(0, rgb.Color(0, 255, 0)); // Green LED
+      rgb.show();
+      Manual(); // Run pre-recorded script
+      break;
+    
+    case SLEEP:
+      rgb.setPixelColor(0, rgb.Color(255, 0, 0)); // Red LED
+      rgb.show();
+      Stop(); 
+      break;
+  }
+}
+
+// --- OBSTACLE AVOIDANCE LOGIC ---
+void object_avoidance() {
+  distance_cm = calculateDistance();
+  Serial.print("State: ");
+
+  switch(state) {
+    // STATE 1: Moving Forward
+    case straight:
+      Serial.print("STRAIGHT");
+      myservo.write(90); 
+      Forward(120);
+      
+      // If blocked, stop and change state to check Left
+      if (distance_cm < PROXIMITY_THRESHOLD && distance_cm > 0) {
+        Serial.println(" -> Blocked! Checking LEFT.");
+        state = scan_left;
+        Stop();
+      } else {
+        Serial.println(" -> Path Clear (Forward)");
+      }
+      break;
+      
+    // STATE 2: Scanning Left
+    case scan_left:
+      Serial.print("SCANNING LEFT");
+      myservo.write(180); // Servo turns Left
+      delay(500); 
+      distance_cm = calculateDistance(); 
+      
+      // If Left is clear, turn Robot Left and go back to straight state
+      if (distance_cm >= PROXIMITY_THRESHOLD) {
+         state = straight;
+         Serial.println(" -> Left is Clear. Turning Left.");
+         Left(120);
+         delay(450);
+      }
+      // If Left is blocked too, change state to check Right
+      else {
+         state = scan_right;
+         Serial.println(" -> Left Blocked! Checking RIGHT.");
+      }
+      break;
+      
+    // STATE 3: Scanning Right
+    case scan_right:
+      Serial.print("SCANNING RIGHT");
+      myservo.write(0); // Servo turns Right
+      delay(500); 
+      distance_cm = calculateDistance(); 
+      
+      // If Right is clear, turn Robot Right
+      if (distance_cm >= PROXIMITY_THRESHOLD) {
+         state = straight;
+         Serial.println(" -> Right is Clear. Turning Right.");
+         Right(120);
+         delay(450);
+      }
+      // If EVERYTHING is blocked, reverse and turn around
+      else if (distance_cm < PROXIMITY_THRESHOLD && distance_cm > 0) {
+         state = straight; 
+         Serial.println(" -> All Blocked! Reversing.");
+         myservo.write(90); 
+         delay(500); 
+         Backward(120);
+         delay(450);
+         Left(120); // 180 turn
+         delay(1300);
+      }
+      break;
+  }
+  Serial.print(" | Dist: ");
+  Serial.println(distance_cm);
+  delay(200); 
+}
+
+// Function to read Ultrasonic Sensor
+long calculateDistance() {
+  digitalWrite(ULTtrig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTtrig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTtrig, LOW);
+  long duration = pulseIn(ULTecho, HIGH);
+  return duration * 0.034 / 2; // Convert time to CM
+}
+
+// --- LINE TRACKING LOGIC ---
+void light_tracking() {
+  int leftStatus = analogRead(L3);
+  int midStatus = analogRead(M4);
+  int rightStatus = analogRead(R5);
+
+  // Determine line position based on threshold values (High > 700-1000)
+  int l = leftStatus; 
+  int m = midStatus;
+  int r = rightStatus;
+
+  // If all sensors see line (or intersection), Stop
+  if (l && m && r > 1000) Stop();
+  // If Middle sensor sees line, go Forward
+  else if (m > 700) Forward(60);
+  // If Left sensor sees line, turn Left
+  else if (l > 700) Left(60);
+  // If Right sensor sees line, turn Right
+  else if (r > 700) Right(60);
+  // Default: Drift Right slightly if lost
+  else Right(60);
+}
+
+// --- MOTOR MOVEMENT FUNCTIONS ---
+
+void Forward(int speedVal) {
+  digitalWrite(AIN_1, 1); // Set Direction
+  digitalWrite(BIN_1, 1);
+  analogWrite(AIN_PWM, speedVal); // Set Speed
+  analogWrite(BIN_PWM, speedVal);
+  digitalWrite(standby, 1); // Enable Motors
+}
+
+void Backward(int speedVal) {
+  digitalWrite(AIN_1, 0);
+  digitalWrite(BIN_1, 0);
+  analogWrite(AIN_PWM, speedVal);
+  analogWrite(BIN_PWM, speedVal);
+  digitalWrite(standby, 1);
+}
+
+void Right(int speedVal) {
+  digitalWrite(AIN_1, 1);
+  digitalWrite(BIN_1, 0); // One motor fwd, one back
+  analogWrite(AIN_PWM, speedVal);
+  analogWrite(BIN_PWM, speedVal);
+  digitalWrite(standby, 1);
+}
+
+void Left(int speedVal) {
+  digitalWrite(AIN_1, 0);
+  digitalWrite(BIN_1, 1); // One motor back, one fwd
+  analogWrite(AIN_PWM, speedVal);
+  analogWrite(BIN_PWM, speedVal);
+  digitalWrite(standby, 1);
+}
+
+void LeftForward(int speedVal) {
+  // Soft turn (one motor faster than the other)
+  digitalWrite(AIN_1, 0);
+  digitalWrite(BIN_1, 1);
+  analogWrite(AIN_PWM, speedVal);
+  analogWrite(BIN_PWM, speedVal/2); // Half speed
+  digitalWrite(standby, 1);
+}
+
+void RightForward(int speedVal) {
+  digitalWrite(AIN_1, 1);
+  digitalWrite(BIN_1, 1);
+  analogWrite(AIN_PWM, speedVal/2);
+  analogWrite(BIN_PWM, speedVal);
+  digitalWrite(standby, 1);
+}
+
+void LeftBackward(int speedVal) {
+  digitalWrite(AIN_1, 0);
+  digitalWrite(BIN_1, 0);
+  analogWrite(AIN_PWM, speedVal);
+  analogWrite(BIN_PWM, speedVal/2);
+  digitalWrite(standby, 1);
+}
+
+void RightBackward(int speedVal) {
+  digitalWrite(AIN_1, 0);
+  digitalWrite(BIN_1, 0);
+  analogWrite(AIN_PWM, speedVal/2);
+  analogWrite(BIN_PWM, speedVal);
+  digitalWrite(standby, 1);
+}
+
+void Stop () {
+  analogWrite(AIN_PWM, 0);
+  analogWrite(BIN_PWM, 0);
+  digitalWrite(standby, 1);
+}
+
+void turnLeft180(int speedVal) {
+  int leftStatus = digitalRead(L3);
+  int midStatus = digitalRead(M4);
+  int rightStatus = digitalRead(R5);
+  
+  // Specific function for a U-turn
+  analogWrite(AIN_PWM, speedVal);
+  analogWrite(BIN_PWM, speedVal);
+  digitalWrite(AIN_1, LOW);
+  digitalWrite(BIN_1, HIGH);
+  delay(150);
+}
+
+// --- MANUAL SEQUENCE ---
+// A pre-programmed set of moves (Forward, Stop, Right, etc.)
+void Manual() {
+  Forward(200); delay(4700);
+  Stop();       delay(1000);
+  Right(100);   delay(550);
+  Stop();       delay(1020);  
+  Forward(200); delay(4700);
+  Stop();       delay(1000);
+  Right(100);   delay(500);
+  Stop();       delay(1000);  
+  Forward(200); delay(4300);  
+  Stop();       delay(1000);
+  Right(100);   delay(550);  
+  Stop();       delay(1000);
+  Forward(200); delay(2500);
+  Stop();       delay(1000);
+  Right(100);   delay(550);  
+  Stop();       delay(1000);
+}
+
+// --- REMOTE CONTROL LOGIC ---
+void IR_remote () {
+ if (modeVal == 0) return;
+
+      switch (modeVal) {
+      case IR_top:
+        Forward(motorSpeed);
+        lastDirection = "Forward";
+      break;
+      
+      case IR_bottom:
+        Backward(motorSpeed);
+        lastDirection = "Backward";
+      break;
+      
+      case IR_left:
+        Left(motorSpeed);
+        lastDirection = "Left";
+      break;
+      
+      case IR_right:
+        Right(motorSpeed);
+        lastDirection = "Right";
+      break;
+      
+      case IR_speed_up:
+             motorSpeed += 20; // Increase Speed
+             if(motorSpeed > 255) motorSpeed = 255;
+             applyLastDirection(); // Apply new speed immediately
+             break;
+      case IR_speed_down:
+             motorSpeed -= 20; // Decrease Speed
+             if(motorSpeed < 0) motorSpeed = 0;
+             applyLastDirection();
+             break;
+    }
+  modeVal = 0;
+}
+
+// Re-apply the last movement command (used when changing speed)
+void applyLastDirection() {
+  if (lastDirection == "Forward") Forward(motorSpeed);
+  else if (lastDirection == "Backward") Backward(motorSpeed);
+  else if (lastDirection == "Left") Left(motorSpeed);
+  else if (lastDirection == "Right") Right(motorSpeed);
+}
